@@ -15,17 +15,12 @@ import zipfile
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Dossier où les .tif seront extraits
 DEM_FOLDER = os.path.join(BASE_DIR, "dem")
 
-# 🔴 METS ICI TON LIEN DRIVE DIRECT (dem.zip)
+# 🔴 Lien direct Google Drive vers dem.zip
 DEM_ZIP_URL = (
     "https://drive.google.com/uc?export=download&id=1Y2oOpHZz5D1o6SodGkiIiCKLHlRRI2bF"
 )
-
-# =========================
-#   MODELES API
-# =========================
 
 class ScanRequest(BaseModel):
     lat: float
@@ -43,11 +38,7 @@ class ScanResponse(BaseModel):
     metal_found: bool
 
 
-# =========================
-#   APP FASTAPI
-# =========================
-
-app = FastAPI(title="Geo-Metal Detector DEM", version="1.0")
+app = FastAPI(title="Geo-Metal DEM v2", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,91 +48,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # =========================
-#   TÉLÉCHARGEMENT DEM.ZIP
+#   TÉLÉCHARGEMENT / UNZIP
 # =========================
 
 def ensure_dem_unzipped():
-    """
-    Vérifie si des .tif existent dans DEM_FOLDER.
-    Si non : télécharge dem.zip depuis Google Drive, puis unzip dans DEM_FOLDER.
-    """
-    # Si dossier DEM existe déjà et contient des .tif -> on ne fait rien
+    """Télécharge dem.zip si besoin, puis extrait les .tif dans DEM_FOLDER."""
     if os.path.isdir(DEM_FOLDER):
-        tif_files = [f for f in os.listdir(DEM_FOLDER) if f.lower().endswith(".tif")]
-        if tif_files:
-            print(f"[DEM] {len(tif_files)} fichiers TIF déjà présents dans {DEM_FOLDER}")
+        tifs = [f for f in os.listdir(DEM_FOLDER) if f.lower().endswith(".tif")]
+        if tifs:
+            print(f"[DEM] {len(tifs)} TIF déjà présents.")
             return
 
     os.makedirs(DEM_FOLDER, exist_ok=True)
-
     zip_path = os.path.join(BASE_DIR, "dem.zip")
 
-    # Télécharger dem.zip si pas déjà présent
     if not os.path.isfile(zip_path):
-        print(f"[DEM] Téléchargement de dem.zip depuis Drive...")
+        print("[DEM] Téléchargement de dem.zip depuis Drive...")
         try:
             resp = requests.get(DEM_ZIP_URL, stream=True, timeout=300)
             resp.raise_for_status()
             with open(zip_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
+                for chunk in resp.iter_content(8192):
                     if chunk:
                         f.write(chunk)
-            print("[DEM] dem.zip téléchargé avec succès.")
+            print("[DEM] dem.zip téléchargé.")
         except Exception as e:
             print(f"[DEM] ERREUR téléchargement dem.zip : {e}")
             return
 
-    # Décompression
     try:
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(DEM_FOLDER)
-        print(f"[DEM] dem.zip extrait dans {DEM_FOLDER}")
+        print(f"[DEM] dem.zip extrait dans {DEM_FOLDER}.")
     except Exception as e:
         print(f"[DEM] ERREUR unzip dem.zip : {e}")
         return
 
-
 # =========================
-#   OUTILS DEM + GEO
+#   UTIL DEM + SCORE
 # =========================
 
 def load_dem_tile(lat: float, lon: float):
     """
-    S'assure d'abord que les TIF sont présents (download + unzip si besoin),
-    puis cherche un .tif qui couvre lat/lon.
+    S'assure que les TIF existent.
+    Essaie de trouver une tuile qui couvre lat/lon.
+    Si aucune ne match par bounds → prend simplement le premier TIF.
     """
     ensure_dem_unzipped()
 
     if not os.path.isdir(DEM_FOLDER):
-        print(f"[DEM] Dossier DEM inexistant après unzip: {DEM_FOLDER}")
+        print("[DEM] Dossier DEM inexistant après unzip.")
         return None
 
-    for fname in os.listdir(DEM_FOLDER):
-        if not fname.lower().endswith(".tif"):
-            continue
+    tif_files = [f for f in os.listdir(DEM_FOLDER) if f.lower().endswith(".tif")]
+    if not tif_files:
+        print("[DEM] Aucun TIF dans DEM_FOLDER.")
+        return None
+
+    candidate_path = None
+
+    for fname in tif_files:
         path = os.path.join(DEM_FOLDER, fname)
         try:
             with rasterio.open(path) as src:
                 left, bottom, right, top = src.bounds
-                # On suppose que le TIF est en WGS84 (lon/lat)
                 if (left <= lon <= right) and (bottom <= lat <= top):
-                    print(f"[DEM] Tuile trouvée: {path}")
+                    print(f"[DEM] Tuile trouvée par bounds: {path}")
                     return path
         except Exception as e:
             print(f"[DEM] Erreur ouverture {path}: {e}")
             continue
 
-    print("[DEM] Aucune tuile ne couvre ce point.")
-    return None
+    # si aucune tuile ne match les bounds → on prend le premier TIF malgré tout
+    candidate_path = os.path.join(DEM_FOLDER, tif_files[0])
+    print(f"[DEM] Aucune tuile ne couvre le point, fallback sur {candidate_path}")
+    return candidate_path
 
 
 def slope_from_window(values: np.ndarray) -> float:
-    """
-    Pente locale normalisée (0–1) à partir d'une fenêtre 3x3.
-    Sécurisée pour les bords.
-    """
+    """Pente locale normalisée (0–1) à partir d'une fenêtre 3x3."""
     if values is None or np.isnan(values).any():
         return 0.0
     if values.shape[0] < 3 or values.shape[1] < 3:
@@ -154,9 +140,7 @@ def slope_from_window(values: np.ndarray) -> float:
 
 
 def roughness(values: np.ndarray) -> float:
-    """
-    Rugosité locale normalisée (0–1) à partir de l'écart-type.
-    """
+    """Rugosité locale normalisée (0–1)."""
     if values is None or np.isnan(values).any():
         return 0.0
     return float(min(np.std(values) / 20.0, 1.0))
@@ -164,28 +148,33 @@ def roughness(values: np.ndarray) -> float:
 
 def geo_score(lat: float, lon: float) -> float:
     """
-    Score géologique 0–100 basé sur la pente + rugosité autour du point.
-    Utilise le DEM réel.
+    Score géologique 0–100 basé sur DEM.
+    Si impossible de lire correctement, retourne 50.0 (neutre).
     """
     tif_path = load_dem_tile(lat, lon)
     if tif_path is None:
-        # Si on n'a aucune tuile, on renvoie un score moyen
         return 50.0
 
     try:
         with rasterio.open(tif_path) as src:
+            # on essaye d'indexer, puis on CLAMP pour rester dans [1, h-2] / [1, w-2]
             row, col = src.index(lon, lat)
+            row = max(1, min(row, src.height - 2))
+            col = max(1, min(col, src.width - 2))
+
             w = rasterio.windows.Window(col - 1, row - 1, 3, 3)
             z = src.read(1, window=w)
 
             if src.nodata is not None:
                 z = np.where(z == src.nodata, np.nan, z)
+
     except Exception as e:
         print(f"[DEM] Erreur lecture DEM pour ({lat}, {lon}) : {e}")
         return 50.0
 
     s = slope_from_window(z)
     r = roughness(z)
+
     score_0_1 = 0.6 * s + 0.4 * r
     return float(score_0_1 * 100.0)
 
@@ -203,17 +192,14 @@ def offset_lon(m: float, lat: float) -> float:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Geo-Metal DEM avec téléchargement Drive prêt."}
+    return {"status": "ok", "message": "Geo-Metal DEM v2 prêt."}
 
 
 @app.post("/scan", response_model=ScanResponse)
 def scan(req: ScanRequest):
     """
-    Scanne un disque de rayon r autour du clic, calcule un score géologique
-    basé sur le DEM réel et renvoie :
-      - best_point
-      - candidates (top 10)
-      - metal_found si score >= 60
+    Scanne un disque de rayon r autour du clic.
+    Calcule score 0–100 à partir du DEM.
     """
     lat0 = req.lat
     lon0 = req.lon
