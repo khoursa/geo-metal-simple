@@ -38,7 +38,7 @@ class ScanResponse(BaseModel):
     metal_found: bool
 
 
-app = FastAPI(title="Geo-Metal DEM v2", version="2.0")
+app = FastAPI(title="Geo-Metal DEM v3", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,11 +54,12 @@ app.add_middleware(
 
 def ensure_dem_unzipped():
     """Télécharge dem.zip si besoin, puis extrait les .tif dans DEM_FOLDER."""
+    # S'il y a déjà au moins un .tif quelque part dans DEM_FOLDER → on ne fait rien
     if os.path.isdir(DEM_FOLDER):
-        tifs = [f for f in os.listdir(DEM_FOLDER) if f.lower().endswith(".tif")]
-        if tifs:
-            print(f"[DEM] {len(tifs)} TIF déjà présents.")
-            return
+        for root, _, files in os.walk(DEM_FOLDER):
+            if any(f.lower().endswith(".tif") for f in files):
+                print(f"[DEM] TIF déjà présents dans {DEM_FOLDER}")
+                return
 
     os.makedirs(DEM_FOLDER, exist_ok=True)
     zip_path = os.path.join(BASE_DIR, "dem.zip")
@@ -92,8 +93,8 @@ def ensure_dem_unzipped():
 def load_dem_tile(lat: float, lon: float):
     """
     S'assure que les TIF existent.
-    Essaie de trouver une tuile qui couvre lat/lon.
-    Si aucune ne match par bounds → prend simplement le premier TIF.
+    Cherche un .tif qui couvre lat/lon (bounds).
+    Si aucune tuile ne match → prend simplement le premier .tif trouvé.
     """
     ensure_dem_unzipped()
 
@@ -101,15 +102,18 @@ def load_dem_tile(lat: float, lon: float):
         print("[DEM] Dossier DEM inexistant après unzip.")
         return None
 
-    tif_files = [f for f in os.listdir(DEM_FOLDER) if f.lower().endswith(".tif")]
-    if not tif_files:
-        print("[DEM] Aucun TIF dans DEM_FOLDER.")
+    tif_paths = []
+    for root, _, files in os.walk(DEM_FOLDER):
+        for f in files:
+            if f.lower().endswith(".tif"):
+                tif_paths.append(os.path.join(root, f))
+
+    if not tif_paths:
+        print("[DEM] Aucun fichier .tif trouvé dans DEM_FOLDER.")
         return None
 
-    candidate_path = None
-
-    for fname in tif_files:
-        path = os.path.join(DEM_FOLDER, fname)
+    # D'abord on essaie de trouver une tuile dont les bounds couvrent le point
+    for path in tif_paths:
         try:
             with rasterio.open(path) as src:
                 left, bottom, right, top = src.bounds
@@ -120,10 +124,10 @@ def load_dem_tile(lat: float, lon: float):
             print(f"[DEM] Erreur ouverture {path}: {e}")
             continue
 
-    # si aucune tuile ne match les bounds → on prend le premier TIF malgré tout
-    candidate_path = os.path.join(DEM_FOLDER, tif_files[0])
-    print(f"[DEM] Aucune tuile ne couvre le point, fallback sur {candidate_path}")
-    return candidate_path
+    # Sinon → fallback : on prend le premier TIF
+    fallback_path = tif_paths[0]
+    print(f"[DEM] Aucune tuile ne couvre le point, fallback sur {fallback_path}")
+    return fallback_path
 
 
 def slope_from_window(values: np.ndarray) -> float:
@@ -157,8 +161,8 @@ def geo_score(lat: float, lon: float) -> float:
 
     try:
         with rasterio.open(tif_path) as src:
-            # on essaye d'indexer, puis on CLAMP pour rester dans [1, h-2] / [1, w-2]
             row, col = src.index(lon, lat)
+            # clamp pour rester à l'intérieur (pour fenêtre 3x3)
             row = max(1, min(row, src.height - 2))
             col = max(1, min(col, src.width - 2))
 
@@ -192,7 +196,7 @@ def offset_lon(m: float, lat: float) -> float:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Geo-Metal DEM v2 prêt."}
+    return {"status": "ok", "message": "Geo-Metal DEM v3 prêt."}
 
 
 @app.post("/scan", response_model=ScanResponse)
