@@ -15,12 +15,17 @@ import zipfile
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Dossier où les TIF seront extraits
 DEM_FOLDER = os.path.join(BASE_DIR, "dem")
 
-# 🔴 Lien direct Google Drive vers dem.zip
+# 🔴 Lien direct Google Drive vers dem.zip (à adapter si tu changes d’ID)
 DEM_ZIP_URL = (
     "https://drive.google.com/uc?export=download&id=1Y2oOpHZz5D1o6SodGkiIiCKLHlRRI2bF"
 )
+
+# =========================
+#   MODELES
+# =========================
 
 class ScanRequest(BaseModel):
     lat: float
@@ -38,6 +43,10 @@ class ScanResponse(BaseModel):
     metal_found: bool
 
 
+# =========================
+#   APP FASTAPI
+# =========================
+
 app = FastAPI(title="Geo-Metal DEM v3", version="3.0")
 
 app.add_middleware(
@@ -53,8 +62,10 @@ app.add_middleware(
 # =========================
 
 def ensure_dem_unzipped():
-    """Télécharge dem.zip si besoin, puis extrait les .tif dans DEM_FOLDER."""
-    # S'il y a déjà au moins un .tif quelque part dans DEM_FOLDER → on ne fait rien
+    """
+    Vérifie s'il y a déjà au moins un .tif dans DEM_FOLDER (ou sous-dossiers).
+    Sinon télécharge dem.zip depuis Drive et l'extrait dans DEM_FOLDER.
+    """
     if os.path.isdir(DEM_FOLDER):
         for root, _, files in os.walk(DEM_FOLDER):
             if any(f.lower().endswith(".tif") for f in files):
@@ -86,6 +97,7 @@ def ensure_dem_unzipped():
         print(f"[DEM] ERREUR unzip dem.zip : {e}")
         return
 
+
 # =========================
 #   UTIL DEM + SCORE
 # =========================
@@ -93,7 +105,7 @@ def ensure_dem_unzipped():
 def load_dem_tile(lat: float, lon: float):
     """
     S'assure que les TIF existent.
-    Cherche un .tif qui couvre lat/lon (bounds).
+    Cherche un .tif qui couvre lat/lon (via les bounds).
     Si aucune tuile ne match → prend simplement le premier .tif trouvé.
     """
     ensure_dem_unzipped()
@@ -112,7 +124,7 @@ def load_dem_tile(lat: float, lon: float):
         print("[DEM] Aucun fichier .tif trouvé dans DEM_FOLDER.")
         return None
 
-    # D'abord on essaie de trouver une tuile dont les bounds couvrent le point
+    # D'abord : essayer de trouver une tuile dont les bounds couvrent le point
     for path in tif_paths:
         try:
             with rasterio.open(path) as src:
@@ -162,7 +174,7 @@ def geo_score(lat: float, lon: float) -> float:
     try:
         with rasterio.open(tif_path) as src:
             row, col = src.index(lon, lat)
-            # clamp pour rester à l'intérieur (pour fenêtre 3x3)
+            # clamp pour rester à l'intérieur (fenêtre 3x3)
             row = max(1, min(row, src.height - 2))
             col = max(1, min(col, src.width - 2))
 
@@ -203,7 +215,7 @@ def root():
 def scan(req: ScanRequest):
     """
     Scanne un disque de rayon r autour du clic.
-    Calcule score 0–100 à partir du DEM.
+    Calcule un score 0–100 à partir du DEM réel.
     """
     lat0 = req.lat
     lon0 = req.lon
@@ -251,3 +263,60 @@ def scan(req: ScanRequest):
         candidates=top_candidates,
         metal_found=metal_found
     )
+
+
+# =========================
+#   DEBUG DEM
+# =========================
+
+@app.get("/debug_dem")
+def debug_dem():
+    """
+    Endpoint de diagnostic :
+    - vérifie que dem.zip a bien été décompressé
+    - liste les .tif trouvés
+    - essaye d’ouvrir le premier TIF avec rasterio
+    - calcule un geo_score test sur (34, -5)
+    """
+    info = {}
+
+    # 1) TIF présents ?
+    ensure_dem_unzipped()
+
+    tif_paths = []
+    if os.path.isdir(DEM_FOLDER):
+        for root, _, files in os.walk(DEM_FOLDER):
+            for f in files:
+                if f.lower().endswith(".tif"):
+                    tif_paths.append(os.path.join(root, f))
+
+    info["dem_folder"] = DEM_FOLDER
+    info["tif_count"] = len(tif_paths)
+    info["tif_paths"] = tif_paths[:5]  # on montre max 5 chemins
+
+    # 2) Essayer d’ouvrir le premier TIF
+    if tif_paths:
+        first_tif = tif_paths[0]
+        try:
+            with rasterio.open(first_tif) as src:
+                info["first_tif"] = {
+                    "path": first_tif,
+                    "crs": str(src.crs),
+                    "width": src.width,
+                    "height": src.height,
+                    "bounds": tuple(src.bounds),
+                    "nodata": src.nodata,
+                }
+        except Exception as e:
+            info["first_tif_error"] = str(e)
+    else:
+        info["first_tif"] = None
+
+    # 3) Essayer un geo_score de test
+    try:
+        test_score = geo_score(34.0, -5.0)
+        info["test_score_34_-5"] = test_score
+    except Exception as e:
+        info["test_score_error"] = str(e)
+
+    return info
